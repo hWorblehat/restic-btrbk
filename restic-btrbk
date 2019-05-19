@@ -1,0 +1,136 @@
+#!/bin/bash
+
+PROG_NAME="$(basename "$0")"
+
+DEFAULT_CACHE_DIR="/var/cache/$PROG_NAME"
+DEFAULT_WORK_DIR="./.$PROG_NAME"
+DEFAULT_RESTIC_CMD=restic
+DEFAULT_BASE_NAME=backup
+
+function usage() {
+	cat << EOF
+$PROG_NAME - Use restic to backup BTRFS snapshots created by btrbk
+
+Usage:
+
+    $PROG_NAME [<options>] <snapshot-dir> [<snapshot-dir> [...]]
+        - Backup snapshots under each <snapshot-dir>
+
+    $PROG_NAME --help
+        - Display this message and exit
+
+Options:
+
+    -h, --help        Display this message and exit.
+
+    -w, --work-dir    Set the working for creating temporary snapshots.
+                      This must be on the same BTRFS volume as the
+                      snapshots being backed up. Defaults to
+                      '$DEFAULT_WORK_DIR'.
+
+    -c, --cache-dir   Restic cache directory.
+                      Defaults to '$DEFAULT_CACHE_DIR'.
+
+    -b, --base-name   Base directory name to prefix all snapshot being
+                      backed up. This cannot be an empty string.
+                      Defaults to the name of the current working
+                      directory, or '$DEFAULT_BASE_NAME' if the current
+                      working directory is '/'.
+
+    -r, --restic-cmd  The command to execute restic. Defaults to
+                      '$DEFAULT_RESTIC_COMMAND'.
+
+    -d, --dry-run     Print commands instead of executing them.
+
+    -v, --verbose     Be verbose.
+    
+EOF
+}
+
+function exit_err() {
+	err=$?
+	echo "Error: $1" >&2
+	usage
+	exit $err
+}
+
+OPTS=$(getopt -o hw:c:b:r:dv -l help,work-dir:,cache-dir:,base-name:,restic-cmd:,dry-run,verbose -n "$PROG_NAME" -- "$@") \
+	|| exit_err "Failed to parse command line options."
+
+eval set -- "$OPTS"
+
+WORK_DIR="$DEFAULT_WORK_DIR"
+CACHE_DIR="$DEFAULT_CACHE_DIR"
+BASE_NAME="$(basename "$(pwd)")"
+[[ "$BASE_NAME" = "/" ]] && BASE_NAME="$DEFAULT_BASE_NAME"
+RESTIC_CMD="$DEFAULT_RESTIC_CMD"
+VERBOSE=""
+DRY_RUN=""
+
+while true; do
+	case "$1" in
+		-h | --help )        usage; exit 0;;
+		-w | --work-dir )    WORK_DIR="$2"; shift;;
+		-c | --cache-dir )   CACHE_DIR="$2"; shift;;
+		-b | --base-name )   BASE_NAME="$2"; shift;;
+		-r | --restic-cmd )  RESTIC_CMD="$2"; shift;;
+		-d | --dry-run )     DRY_RUN="echo";;
+		-v | --verbose )     VERBOSE=-v;;
+		-- )                 shift; break;;
+		* )                  break;;
+	esac
+	shift
+done
+
+[ ! -z "$BASE_NAME" ] && [[ "$BASE_NAME" != *"/"* ]] \
+	|| exit_err "Invalid base name: '$BASE_NAME'"
+
+SNAPSHOT_DIRS="$@"
+
+[ ! -z "$SNAPSHOT_DIRS" ] || exit_err "No snapshot dirs specified"
+
+# Snapshot Filename Regex
+#
+# Thie has x groups:
+#   1. Name of subvolume on which snapshot is based
+#   2. Year
+#   3. Month of year
+#   4. Day of month
+#   5. Hour of day
+#   6. Minute of hour
+#   7. (Optional) index within minute
+SNAPSHOT_PATTERN='^(.*)\.([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})(_[0-9]+)?$'
+
+$DRY_RUN mkdir $VERBOSE -p "$CACHE_DIR" "/$BASE_NAME" "$WORK_DIR" \
+	&& $DRY_RUN mount $VERBOSE --bind "$WORK_DIR" "/$BASE_NAME" || exit $?
+$DRY_RUN trap "umount $VERBOSE '/$BASE_NAME'" EXIT
+
+for snapshot_dir in "${SNAPSHOT_DIRS[@]}"; do
+
+	[[ -d "$snapshot_dir" ]] || exit_err "$snapshot_dir is not a directory."
+
+	$DRY_RUN mkdir $VERBOSE -p "$WORK_DIR/$snapshot_dir" || exit $?
+	
+	for subvol in $(ls $snapshot_dir | grep -E "$SNAPSHOT_PATTERN" | sed -E "s/$SNAPSHOT_PATTERN/\\1/" | uniq); do
+
+		snapshots=($(ls -d $snapshot_dir/$subvol*))
+		latest=${snapshots[$((${#snapshots[@]}-1))]}
+	
+		if [[ ! "$latest" =~ $SNAPSHOT_PATTERN ]]; then
+			echo "Failed to parse snapshot timestamp for $LATEST" >&2
+			exit 1
+		fi
+		timestamp="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]} ${BASH_REMATCH[5]}:${BASH_REMATCH[6]}:00"
+		echo "Latest snapshot for $host/$subvol: $timestamp"
+		
+		$DRY_RUN btrfs subvolume snapshot "$latest" "$WORK_DIR/$snapshot_dir/$subvol" || exit $?
+		$DRY_RUN "$RESTIC_CMD" backup \
+			--one-file-system \
+			--cache-dir "$CACHE_DIR" \
+			--time "$timestamp" \
+			$VERBOSE \
+			"/$BASE_NAME/$snapshot_dir/$subvol"
+		$DRY_RUN btrfs subvolume delete "$WORK_DIR/$snapshot_dir/$subvol" || exit $?
+	done
+done
+
