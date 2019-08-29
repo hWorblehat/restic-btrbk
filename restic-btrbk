@@ -112,9 +112,15 @@ fi
 #   7. (Optional) index within minute
 SNAPSHOT_PATTERN='^(.*)\.([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})(_[0-9]+)?$'
 
+BACKUP_PATTERN='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$'
+
 $DRY_RUN mkdir $VERBOSE -p "$CACHE_DIR" "/$BASE_NAME" "$WORK_DIR" \
 	&& $DRY_RUN mount $VERBOSE --bind "$WORK_DIR" "/$BASE_NAME" || exit $?
 $DRY_RUN trap "umount $VERBOSE '/$BASE_NAME'" EXIT
+
+CURRENT_BACKUPS="$("$RESTIC_CMD" snapshots --last --host $(hostname) || exit $?)"
+echo "Current backups: "
+echo "$CURRENT_BACKUPS"
 
 for snapshot_dir in "${SNAPSHOT_DIRS[@]}"; do
 
@@ -127,21 +133,31 @@ for snapshot_dir in "${SNAPSHOT_DIRS[@]}"; do
 		snapshots=($(ls -d $snapshot_dir/$subvol*))
 		latest=${snapshots[$((${#snapshots[@]}-1))]}
 	
-		if [[ ! "$latest" =~ $SNAPSHOT_PATTERN ]]; then
-			echo "Failed to parse snapshot timestamp for $LATEST" >&2
-			exit 1
-		fi
+		[[ "$latest" =~ $SNAPSHOT_PATTERN ]] \
+			|| exit_err "Failed to parse snapshot timestamp for $LATEST"
+
 		timestamp="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]} ${BASH_REMATCH[5]}:${BASH_REMATCH[6]}:00"
 		echo "Latest snapshot for $host/$subvol: $timestamp"
+
+		latest_backup="$(echo "$CURRENT_BACKUPS" | grep -F "/$BASE_NAME/$snapshot_dir/$subvol" | cut -c 11-29)"
+
+		[ ! -z "$latest_backup" ] && [[ ! "$latest_backup" =~ $BACKUP_PATTERN ]] \
+			&& exit_err "Failed to parse latest backup timestamp for $host/$subvol: $latest_backup"
 		
-		$DRY_RUN btrfs subvolume snapshot "$latest" "$WORK_DIR/$snapshot_dir/$subvol" || exit $?
-		$DRY_RUN "$RESTIC_CMD" backup \
-			--one-file-system \
-			--cache-dir "$CACHE_DIR" \
-			--time "$timestamp" \
-			$VERBOSE \
-			"/$BASE_NAME/$snapshot_dir/$subvol"
-		$DRY_RUN btrfs subvolume delete "$WORK_DIR/$snapshot_dir/$subvol" || exit $?
+		echo "Latest backup for $host/$subvol: $latest_backup"
+
+		if [ "$timestamp" \> "$latest_backup" ]; then
+			$DRY_RUN btrfs subvolume snapshot "$latest" "$WORK_DIR/$snapshot_dir/$subvol" \
+				|| exit $?
+			$DRY_RUN "$RESTIC_CMD" backup \
+				--one-file-system \
+				--cache-dir "$CACHE_DIR" \
+				--time "$timestamp" \
+				$VERBOSE \
+				"/$BASE_NAME/$snapshot_dir/$subvol"
+			$DRY_RUN btrfs subvolume delete "$WORK_DIR/$snapshot_dir/$subvol" \
+				|| exit $?
+		fi
 	done
 done
 
