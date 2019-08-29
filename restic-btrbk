@@ -2,10 +2,13 @@
 
 PROG_NAME="$(basename "$0")"
 
+KEEP_ALL="all"
+
 DEFAULT_CACHE_DIR="/var/cache/$PROG_NAME"
 DEFAULT_WORK_DIR="./.$PROG_NAME"
 DEFAULT_RESTIC_CMD=restic
 DEFAULT_BASE_NAME=backup
+DEFAULT_KEEP="$KEEP_ALL"
 
 function usage() {
 	cat << EOF
@@ -38,7 +41,19 @@ Options:
                       working directory is '/'.
 
     -r, --restic-cmd  The command to execute restic. Defaults to
-                      '$DEFAULT_RESTIC_COMMAND'.
+                      '$DEFAULT_RESTIC_CMD'.
+
+    -k, --keep        Policy describing when to delete snapshots.
+                      Possible arguments:
+
+                      $KEEP_ALL  Never delete snapshots
+
+                      <a>-<b>    If one or more snapshot directories
+                                 has at least <b> snapshots, delete
+                                 backups for all directories, keeping
+                                 the latest <a> of each.
+
+                      Defaults to '$DEFAULT_KEEP'.
 
     -d, --dry-run     Print commands instead of executing them.
 
@@ -54,7 +69,7 @@ function exit_err() {
 	exit $err
 }
 
-OPTS=$(getopt -o hw:c:b:r:dv -l help,work-dir:,cache-dir:,base-name:,restic-cmd:,dry-run,verbose -n "$PROG_NAME" -- "$@") \
+OPTS=$(getopt -o hw:c:b:r:k:dv -l help,work-dir:,cache-dir:,base-name:,restic-cmd:,keep:,dry-run,verbose -n "$PROG_NAME" -- "$@") \
 	|| exit_err "Failed to parse command line options."
 
 eval set -- "$OPTS"
@@ -64,6 +79,7 @@ CACHE_DIR="$DEFAULT_CACHE_DIR"
 BASE_NAME="$(basename "$(pwd)")"
 [[ "$BASE_NAME" = "/" ]] && BASE_NAME="$DEFAULT_BASE_NAME"
 RESTIC_CMD="$DEFAULT_RESTIC_CMD"
+KEEP="$DEFAULT_KEEP"
 VERBOSE=""
 DRY_RUN=""
 
@@ -74,6 +90,7 @@ while true; do
 		-c | --cache-dir )   CACHE_DIR="$2"; shift;;
 		-b | --base-name )   BASE_NAME="$2"; shift;;
 		-r | --restic-cmd )  RESTIC_CMD="$2"; shift;;
+		-k | --keep )        KEEP="$2"; shift;;
 		-d | --dry-run )     DRY_RUN="echo";;
 		-v | --verbose )     VERBOSE=-v;;
 		-- )                 shift; break;;
@@ -84,6 +101,15 @@ done
 
 [ ! -z "$BASE_NAME" ] && [[ "$BASE_NAME" != *"/"* ]] \
 	|| exit_err "Invalid base name: '$BASE_NAME'"
+
+KEEP_MIN=""
+KEEP_MAX=""
+if [ "$KEEP" != "$KEEP_ALL" ]; then
+	KEEP_PATTERN='^([0-9]+)-([0-9]+)$'
+	[[ "$KEEP" =~ $KEEP_PATTERN ]] || exit_err "Invalid keep specification: $KEEP"
+	KEEP_MIN="${BASH_REMATCH[1]}"
+	KEEP_MAX="${BASH_REMATCH[2]}"
+fi
 
 SNAPSHOT_DIRS="$@"
 
@@ -160,4 +186,28 @@ for snapshot_dir in "${SNAPSHOT_DIRS[@]}"; do
 		fi
 	done
 done
+
+ALL_BACKUPS="$("$RESTIC_CMD" snapshots --host $(hostname) || exit $?)"
+echo "Backups now in repository: "
+echo "$ALL_BACKUPS"
+
+[ "$KEEP" == "$KEEP_ALL" ] && exit 0
+
+max_snapshots=0
+
+for snapshot_dir in "${SNAPSHOT_DIRS[@]}"; do
+	snapshots="$(echo "$ALL_BACKUPS" | grep -F "/$BASE_NAME/$snapshot_dir/$subvol" | wc -l)"
+	if [ "$snapshots" -gt "$max_snapshots" ]; then
+		max_snapshots="$snapshots"
+	fi
+done
+
+if [ "$max_snapshots" -gt "$KEEP_MAX" ]; then
+	dry_run=""
+	[ -z "$DRY_RUN" ] || dry_run="--dry-run"
+	"$RESTIC_CMD" forget \
+		--keep-last $KEEP_MIN \
+		--prune \
+		$dry_run
+fi
 
