@@ -89,6 +89,17 @@ SNAPSHOT_DIRS="$@"
 
 [ ! -z "$SNAPSHOT_DIRS" ] || exit_err "No snapshot dirs specified"
 
+if [ -z "$DRY_RUN" ]; then
+	if ! exec 100>"$WORK_DIR/lockfile"; then
+		echo "Failed to obtain descriptor for lock file" >&2
+		exit 1
+	fi
+	if ! flock -n 100; then
+		echo "Lock already held. Presumably another restic process is running" >&2
+		exit 2
+	fi
+fi
+
 # Snapshot Filename Regex
 #
 # Thie has x groups:
