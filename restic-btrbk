@@ -115,6 +115,24 @@ SNAPSHOT_DIRS="$@"
 
 [ ! -z "$SNAPSHOT_DIRS" ] || exit_err "No snapshot dirs specified"
 
+MOUNT_POINT=""
+CURRENT_SNAPSHOT=""
+
+function cleanup() {
+	[ -n "$CURRENT_SNAPSHOT" ] && [ -d "$CURRENT_SNAPSHOT" ] && btrfs subvolume delete "$CURRENT_SNAPSHOT"
+	[ -n "$MOUNT_POINT" ] && umount $VERBOSE "$MOUNT_POINT"
+}
+$DRY_RUN trap cleanup EXIT
+
+# Handles the exit code of calls to restic
+#
+# If restic receives a SIGINT, it performs cleanup operations then esits with code 130.
+# Bash doesn't recognise this as having being killed by a signal, so continues running.
+# Calling this function with the exit code from restic should fix that.
+function restic_exit() {
+	[ $1 -eq 130 ] && kill -s INT $$ || exit $1
+}
+
 if [ -z "$DRY_RUN" ]; then
 	if ! exec 100>"$WORK_DIR/lockfile"; then
 		echo "Failed to obtain descriptor for lock file" >&2
@@ -142,9 +160,9 @@ BACKUP_PATTERN='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$'
 
 $DRY_RUN mkdir $VERBOSE -p "$CACHE_DIR" "/$BASE_NAME" "$WORK_DIR" \
 	&& $DRY_RUN mount $VERBOSE --bind "$WORK_DIR" "/$BASE_NAME" || exit $?
-$DRY_RUN trap "umount $VERBOSE '/$BASE_NAME'" EXIT
+MOUNT_POINT="/$BASE_NAME"
 
-CURRENT_BACKUPS="$("$RESTIC_CMD" snapshots --last --host $(hostname) || exit $?)"
+CURRENT_BACKUPS="$("$RESTIC_CMD" snapshots --last --host $(hostname) || restic_exit $?)"
 echo "Current backups: "
 echo "$CURRENT_BACKUPS"
 
@@ -173,21 +191,27 @@ for snapshot_dir in "${SNAPSHOT_DIRS[@]}"; do
 		echo "Latest backup for $host/$subvol: $latest_backup"
 
 		if [ "$timestamp" \> "$latest_backup" ]; then
-			$DRY_RUN btrfs subvolume snapshot "$latest" "$WORK_DIR/$snapshot_dir/$subvol" \
+			
+			CURRENT_SNAPSHOT="$WORK_DIR/$snapshot_dir/$subvol"
+			$DRY_RUN btrfs subvolume snapshot "$latest" "$CURRENT_SNAPSHOT" \
 				|| exit $?
+
 			$DRY_RUN "$RESTIC_CMD" backup \
 				--one-file-system \
 				--cache-dir "$CACHE_DIR" \
 				--time "$timestamp" \
 				$VERBOSE \
-				"/$BASE_NAME/$snapshot_dir/$subvol"
-			$DRY_RUN btrfs subvolume delete "$WORK_DIR/$snapshot_dir/$subvol" \
+				"/$BASE_NAME/$snapshot_dir/$subvol" \
+				|| restic_exit $?
+			
+			$DRY_RUN btrfs subvolume delete "$CURRENT_SNAPSHOT" \
 				|| exit $?
+			CURRENT_SNAPSHOT=""
 		fi
 	done
 done
 
-ALL_BACKUPS="$("$RESTIC_CMD" snapshots --host $(hostname) || exit $?)"
+ALL_BACKUPS="$("$RESTIC_CMD" snapshots --host $(hostname) || restic_exit $?)"
 echo "Backups now in repository: "
 echo "$ALL_BACKUPS"
 
